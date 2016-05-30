@@ -2,77 +2,137 @@ use std::default::Default;
 use std::fmt;
 use std::path::Path;
 
-use syntax::ast;
-use syntax::codemap;
+use syntax::ast::{Ident, Lit};
+use syntax::ast::LitKind::*;
+use syntax::codemap::{self, Span, Spanned};
 use syntax::ext::base;
 use syntax::parse;
-use syntax::ptr::P;
 use syntax::util::small_vector::SmallVector;
 
-use bindgen::{BindgenOptions, Bindings, Logger};
+use bindgen::{Builder, LinkType, Logger};
 
 use clang_sys;
 
 use parser;
 
-pub fn bindgen_macro(cx: &mut base::ExtCtxt,
-                     sp: codemap::Span,
-                     tts: &[ast::TokenTree])
-                     -> Box<base::MacResult + 'static> {
-     let mut options = BindgenOptions {
-         builtins: true,
-         ..Default::default()
-     };
+use easy_plugin::PluginResult;
 
-    if !parser::parse_macro_opts(cx, tts, &mut options) {
-        return base::DummyResult::any(sp);
+easy_plugin! {
+    struct Arguments {
+        $($file:lit), *
+        $(, $($key:ident = $value:lit), *)?
     }
 
-    let clang = clang_sys::support::Clang::find(None).expect("No clang found, is it installed?");
-    for dir in clang.c_search_paths {
-        options.clang_args.push("-idirafter".to_owned());
-        options.clang_args.push(dir.to_str().unwrap().to_owned());
-    }
+    pub fn bindgen_macro(cx: &mut base::ExtCtxt,
+                         sp: Span,
+                         args: Arguments)
+                         -> PluginResult<Box<base::MacResult + 'static>> {
+        fn args_to_options(args: Arguments) -> PluginResult<Builder<'static>> {
+            let mut builder = Builder::default();
 
-    // Add the directory of the header to the include search path.
-    let filename = cx.codemap().span_to_filename(sp);
-    let mod_dir = Path::new(&filename).parent().unwrap();
-    options.clang_args.push("-I".into());
-    options.clang_args.push(mod_dir.to_str().unwrap().into());
-
-    // We want the span for errors to just match the bindgen! symbol
-    // instead of the whole invocation which can span multiple lines
-    let mut short_span = sp;
-    short_span.hi = short_span.lo + codemap::BytePos(8);
-
-    let logger = MacroLogger {
-        sp: short_span,
-        cx: cx,
-    };
-
-    match Bindings::generate(&options, Some(&logger as &Logger), None) {
-        Ok(bindings) => {
-            // syntex_syntax is not compatible with libsyntax so convert to string and reparse
-            let bindings_str = bindings.to_string();
-            // Unfortunately we lose span information due to reparsing
-            let mut parser = parse::new_parser_from_source_str(cx.parse_sess(),
-                                                               cx.cfg(),
-                                                               "(Auto-generated bindings)"
-                                                                   .to_string(),
-                                                               bindings_str);
-
-            let mut items = Vec::new();
-            while let Ok(Some(item)) = parser.parse_item() {
-                items.push(item);
+            for (key, value) in args.key.unwrap().iter().zip(args.value.unwrap()) {
+               try!(decode_key_value(&key, &value, &mut builder));
             }
 
-            Box::new(BindgenResult {
-                items: Some(SmallVector::many(items)),
-            }) as Box<base::MacResult>
-
+            Ok(builder)
         }
-        Err(_) => base::DummyResult::any(sp),
+
+        let logger = MacroLogger {
+            // We want the span for errors to just match the bindgen! symbol
+            // instead of the whole invocation which can span multiple lines
+            sp: Span {
+                hi: sp.lo + codemap::BytePos(8),
+                ..sp
+            },
+            cx: cx,
+        };
+        let mut builder = try!(args_to_options(args));
+        builder.log(&logger);
+
+        let clang = clang_sys::support::Clang::find(None).expect("No clang found, is it installed?");
+        for dir in clang.c_search_paths {
+            builder.clang_arg("-idirafter");
+            builder.clang_arg(dir.to_str().unwrap());
+        }
+
+        // Add the directory of the header to the include search path.
+        let filename = cx.codemap().span_to_filename(sp);
+        let mod_dir = Path::new(&filename).parent().unwrap();
+        builder.clang_arg("-I");
+        builder.clang_arg(mod_dir.to_str().unwrap());
+
+        match builder.generate() {
+            Ok(bindings) => {
+                // syntex_syntax is not compatible with libsyntax so convert to string and reparse
+                let bindings_str = bindings.to_string();
+                // Unfortunately we lose span information due to reparsing
+                let mut parser = parse::new_parser_from_source_str(cx.parse_sess(),
+                                                                   cx.cfg(),
+                                                                   "(Auto-generated bindings)"
+                                                                       .to_string(),
+                                                                   bindings_str);
+
+                let mut items = Vec::new();
+                while let Ok(Some(item)) = parser.parse_item() {
+                    items.push(item);
+                }
+
+                Ok(Box::new(base::MacEager {
+                    items: Some(SmallVector::many(items)),
+                    ..Default::default()
+                }))
+
+            }
+            Err(()) => Err((sp, "Don't work".into())),
+        }
     }
+}
+
+fn decode_key_value(key: &Spanned<Ident>, value: &Lit, builder: &mut Builder) -> PluginResult<()> {
+    let key_str: &str = &key.node.name.as_str();
+    match (key_str, &value.node) {
+        ("builtins", &Bool(b)) => {
+            if b {
+                builder.builtins();
+            }
+        }
+        ("match", &Str(ref s, _)) => {
+            builder.match_pat(s as &str);
+        }
+        ("allow_unknown_types", &Bool(b)) => {
+            if !b {
+                builder.forbid_unknown_types();
+            }
+        }
+        ("clang_args", &Str(ref s, _)) => {
+            for arg in parser::parse_process_args(s) {
+                builder.clang_arg(arg);
+            }
+        }
+        ("override_enum_type", &Str(ref s, _)) => {
+            builder.override_enum_ty(s as &str);
+        }
+        ("link", &Str(ref s, _)) => {
+            // TODO: dupplicate of main
+            let parts = s.split('=').collect::<Vec<_>>();
+            let (name, kind) = match parts.len() {
+                1 => (parts[0], LinkType::Dynamic),
+                2 => {
+                    (parts[1],
+                     match parts[0] {
+                        "static" => LinkType::Static,
+                        "dynamic" => LinkType::Dynamic,
+                        "framework" => LinkType::Framework,
+                        _ => return Err((value.span, "Invalid link type".into())),
+                    })
+                }
+                _ => return Err((value.span, "Invalid link directive".into())),
+            };
+            builder.link(name, kind);
+        }
+        _ => return Err((key.span, format!("Invalid key or value: {}", key_str))),
+    }
+    Ok(())
 }
 
 struct MacroLogger<'a, 'b: 'a> {
@@ -90,18 +150,9 @@ impl<'a, 'b> Logger for MacroLogger<'a, 'b> {
     }
 }
 
+// ExtCtxt is not Debug
 impl<'a, 'b> fmt::Debug for MacroLogger<'a, 'b> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "MacroLogger")
-    }
-}
-
-struct BindgenResult {
-    items: Option<SmallVector<P<ast::Item>>>,
-}
-
-impl base::MacResult for BindgenResult {
-    fn make_items(mut self: Box<BindgenResult>) -> Option<SmallVector<P<ast::Item>>> {
-        self.items.take()
     }
 }
