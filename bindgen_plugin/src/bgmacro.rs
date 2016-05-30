@@ -11,7 +11,7 @@ use syntax::util::small_vector::SmallVector;
 
 use bindgen::{Builder, LinkType, Logger};
 
-use clang_sys;
+use clang_sys::support::Clang;
 
 use parser;
 
@@ -49,7 +49,7 @@ easy_plugin! {
         let mut builder = try!(args_to_options(args));
         builder.log(&logger);
 
-        let clang = clang_sys::support::Clang::find(None).expect("No clang found, is it installed?");
+        let clang = Clang::find(None).expect("No clang found, is it installed?");
         for dir in clang.c_search_paths {
             builder.clang_arg("-idirafter");
             builder.clang_arg(dir.to_str().unwrap());

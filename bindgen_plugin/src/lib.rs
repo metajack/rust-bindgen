@@ -1,13 +1,11 @@
-#![crate_name = "bindgen_plugin"]
-#![crate_type = "dylib"]
 #![feature(plugin, plugin_registrar, rustc_private)]
 #![plugin(easy_plugin)]
 
 extern crate bindgen;
 extern crate rustc_plugin;
 extern crate syntax;
-extern crate easy_plugin;
 extern crate clang_sys;
+extern crate easy_plugin;
 
 mod bgmacro;
 mod parser;
