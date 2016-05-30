@@ -19,8 +19,10 @@ use easy_plugin::PluginResult;
 
 easy_plugin! {
     struct Arguments {
-        $($file:lit), *
-        $(, $($key:ident = $value:lit), *)?
+        $file:lit
+        $(
+            $(, $key:ident = $value:lit) *
+         )?
     }
 
     pub fn bindgen_macro(cx: &mut base::ExtCtxt,
